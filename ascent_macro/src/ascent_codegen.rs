@@ -35,6 +35,15 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
          #rel_ind_common: #rel_ind_common_type,
       });
       field_defaults.push(quote! {#name : Default::default(), #rel_ind_common: Default::default(),});
+      if mir.config.well_founded && !mir.hidden_relations.contains(rel) {
+         let undefined_name = undefined_rel_name(rel);
+         let field_types = tuple_type(&rel.field_types);
+         relation_fields.push(quote! {
+            #[doc = "The facts that are neither true nor false in the well-founded model"]
+            pub #undefined_name: ::std::vec::Vec<#field_types>,
+         });
+         field_defaults.push(quote! {#undefined_name: Default::default(),});
+      }
       if rel.is_lattice && mir.is_parallel {
          let lattice_mutex_name = lattice_insertion_mutex_var_name(rel);
          relation_fields.push(quote! {
@@ -76,15 +85,28 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
    for (i, _scc) in sccs_ordered.iter().enumerate() {
       let msg = format!("scc {}", i);
       let scc_compiled = compile_mir_scc(mir, i);
-      sccs_compiled.push(quote! {
+      let scc_compiled = quote! {
          ascent::internal::comment(#msg);
          {
             let _scc_start_time = ::ascent::internal::Instant::now();
             #scc_compiled
             _self.scc_times[#i] += _scc_start_time.elapsed();
          }
-      });
+      };
+      if i > 0 && sccs_ordered[i - 1].alternates_with_next {
+         let possible_scc_compiled = sccs_compiled.pop().unwrap();
+         sccs_compiled.push(compile_alternating_sccs(mir, i - 1, possible_scc_compiled, scc_compiled));
+      } else {
+         sccs_compiled.push(scc_compiled);
+      }
    }
+   let compute_undefined = compile_compute_undefined(mir);
+   let user_relations = mir.relations_ir_relations.keys().filter(|rel| !mir.hidden_relations.contains(rel));
+   let truth_fns = if mir.config.well_founded {
+      user_relations.sorted_by_key(|rel| &rel.name).map(|rel| compile_truth_fn(rel, mir)).collect_vec()
+   } else {
+      vec![]
+   };
 
    let update_indices_body = compile_update_indices_function_body(mir);
    let relation_sizes_body = compile_relation_sizes_body(mir);
@@ -188,6 +210,7 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
             self.update_indices_priv();
             let _self = self;
             #(#sccs_compiled)*
+            #compute_undefined
          }
       }
    };
@@ -206,6 +229,7 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
             self.update_indices_priv();
             let _self = self;
             #(#sccs_compiled)*
+            #compute_undefined
             true
          }
       }
@@ -219,6 +243,7 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
          let _self = &mut __run_res;
          #(#relation_initializations)*
          #(#sccs_compiled)*
+         #compute_undefined
       }
    };
 
@@ -307,6 +332,7 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
             #![allow(clippy::all)]
             #scc_times_summary_body
          }
+         #(#truth_fns)*
       }
       impl #impl_impl_generics Default for #struct_name #impl_ty_generics #impl_where_clause {
          fn default() -> Self {
@@ -599,6 +625,11 @@ fn compile_mir_scc(mir: &AscentMir, scc_ind: usize) -> proc_macro2::TokenStream 
    } else {
       quote! {__changed.load(std::sync::atomic::Ordering::Relaxed)}
    };
+   let record_changed_code = if scc_ind > 0 && mir.sccs[scc_ind - 1].alternates_with_next {
+      quote! { __true_facts_changed |= #check_changed_code; }
+   } else {
+      quote! {}
+   };
 
    let evaluate_rules_loop = if scc.is_looping {
       quote! {
@@ -612,6 +643,7 @@ fn compile_mir_scc(mir: &AscentMir, scc_ind: usize) -> proc_macro2::TokenStream 
 
             #(#unfreeze_code)*
             #(#shift_delta_to_total_new_to_delta)*
+            #record_changed_code
             _self.scc_iters[#scc_ind] += 1;
             if !#check_changed_code {break;}
             __check_return_conditions!();
@@ -631,6 +663,7 @@ fn compile_mir_scc(mir: &AscentMir, scc_ind: usize) -> proc_macro2::TokenStream 
 
             #(#shift_delta_to_total_new_to_delta)*
             #(#shift_delta_to_total_new_to_delta)*
+            #record_changed_code
             _self.scc_iters[#scc_ind] += 1;
             __check_return_conditions!();
          }
@@ -647,9 +680,127 @@ fn compile_mir_scc(mir: &AscentMir, scc_ind: usize) -> proc_macro2::TokenStream 
    }
 }
 
+fn compile_alternating_sccs(
+   mir: &AscentMir, possible_scc_ind: usize, possible_scc_compiled: TokenStream, scc_compiled: TokenStream,
+) -> TokenStream {
+   let sorted_possible_relations =
+      mir.sccs[possible_scc_ind].dynamic_relations.iter().sorted_by_key(|(rel, _)| &rel.name);
+   let reset_possible_relations = sorted_possible_relations.flat_map(|(rel, indices)| {
+      let sorted_indices = indices.iter().map(IrRelation::ir_name).sorted();
+      [rel.name.clone(), rel_ind_common_var_name(rel)].into_iter().chain(sorted_indices).map(|field| {
+         quote! { _self.#field = Default::default(); }
+      })
+   });
+   quote! {
+      loop {
+         let mut __true_facts_changed = false;
+         #(#reset_possible_relations)*
+         #possible_scc_compiled
+         #scc_compiled
+         if !__true_facts_changed {break;}
+      }
+   }
+}
+
+/// An expression for whether the relation `rel` of `_self` contains the row referenced by `row`
+fn rel_contains_expr(rel: &RelationIdentity, mir: &AscentMir, _self: &TokenStream, row: &TokenStream) -> TokenStream {
+   let (index, rel_ind_common) = (mir.relations_full_indices[rel].ir_name(), rel_ind_common_var_name(rel));
+   quote! {
+      ::ascent::internal::RelFullIndexRead::contains_key(
+         &::ascent::internal::ToRelIndex0::to_rel_index(&#_self.#index, &#_self.#rel_ind_common), #row)
+   }
+}
+
+/// An expression for the value the lattice `rel` of `_self` has for the key of `row`, if any
+fn lattice_value_expr(rel: &RelationIdentity, mir: &AscentMir, _self: &TokenStream, row: &TokenStream) -> TokenStream {
+   let (rel_name, index) = (&rel.name, mir.lattices_full_indices[rel].ir_name());
+   let lat_ind = syn::Index::from(rel.field_types.len() - 1);
+   let key = (0..rel.field_types.len() - 1).map(syn::Index::from).map(|i| parse_quote! {#row.#i.clone()});
+   let key = tuple(&key.collect_vec());
+   if mir.is_parallel {
+      quote! { #_self.#index.get_cloned(&#key).map(|__ind| #_self.#rel_name[__ind].read().unwrap().#lat_ind.clone()) }
+   } else {
+      quote! {
+         ::ascent::internal::RelIndexRead::index_get(&#_self.#index, &#key)
+            .map(|mut __inds| #_self.#rel_name[*__inds.next().unwrap()].#lat_ind.clone())
+      }
+   }
+}
+
+fn compile_compute_undefined(mir: &AscentMir) -> TokenStream {
+   let mut res = vec![];
+   let _self = quote! { _self };
+   for (rel, possible_rel) in mir.possible_relations.iter().sorted_by_key(|(rel, _)| &rel.name) {
+      let undefined_name = undefined_rel_name(rel);
+      let possible_rel_name = &possible_rel.name;
+      let (freeze, possible_rows, row, is_true) = if rel.is_lattice {
+         let lock = if mir.is_parallel {
+            quote! {.read().unwrap()}
+         } else {
+            quote! {}
+         };
+         let lat_ind = syn::Index::from(rel.field_types.len() - 1);
+         let true_value = lattice_value_expr(rel, mir, &_self, &quote! {__row});
+         let possible_rows = quote! { __i in 0.._self.#possible_rel_name.len() };
+         let row = quote! { _self.#possible_rel_name[__i]#lock.clone() };
+         (quote! {}, possible_rows, row, quote! { #true_value.as_ref() == Some(&__row.#lat_ind) })
+      } else {
+         let possible_index = mir.relations_full_indices[possible_rel].ir_name();
+         let possible_rel_ind_common = rel_ind_common_var_name(possible_rel);
+         let freeze = if mir.is_parallel {
+            quote! { _self.#possible_index.freeze(); }
+         } else {
+            quote! {}
+         };
+         let possible_rows = quote! {
+            (__row, _) in ::ascent::internal::RelIndexReadAll::iter_all(
+               &_self.#possible_index.to_rel_index(&_self.#possible_rel_ind_common))
+         };
+         let row = (0..rel.field_types.len()).map(syn::Index::from).map(|i| parse_quote! {__row.#i.clone()});
+         let row = tuple(&row.collect_vec());
+         let row = quote! {{ let __row = __row.tuple_of_borrowed(); #row }};
+         (freeze, possible_rows, row, rel_contains_expr(rel, mir, &_self, &quote! {&__row}))
+      };
+      res.push(quote! {
+         _self.#undefined_name.clear();
+         #freeze
+         for #possible_rows {
+            let __row = #row;
+            if !(#is_true) {
+               _self.#undefined_name.push(__row);
+            }
+         }
+      });
+   }
+   quote! { #(#res)* }
+}
+
+fn compile_truth_fn(rel: &RelationIdentity, mir: &AscentMir) -> TokenStream {
+   let fn_name = Ident::new(&format!("{}_truth", rel.name), rel.name.span());
+   let row_type = tuple_type(&rel.field_types);
+   let (_self, fact) = (quote! { self }, quote! { fact });
+   let has_fact = |rel: &RelationIdentity| {
+      if rel.is_lattice {
+         let (value, lat_ind) =
+            (lattice_value_expr(rel, mir, &_self, &fact), syn::Index::from(rel.field_types.len() - 1));
+         quote! { #value.as_ref() == Some(&fact.#lat_ind) }
+      } else {
+         rel_contains_expr(rel, mir, &_self, &fact)
+      }
+   };
+   let (is_true, is_undefined) = (has_fact(rel), mir.possible_relations.get(rel).map(has_fact));
+   let undefined = is_undefined.map(|is_undefined| quote! { else if #is_undefined { ::ascent::Truth::Undefined } });
+   quote! {
+      #[doc = "The truth value of `fact` in the well-founded model"]
+      pub fn #fn_name(&self, fact: &#row_type) -> ::ascent::Truth {
+         if #is_true { ::ascent::Truth::True } #undefined else { ::ascent::Truth::False }
+      }
+   }
+}
+
 fn compile_relation_sizes_body(mir: &AscentMir) -> proc_macro2::TokenStream {
    let mut write_sizes = vec![];
-   for r in mir.relations_ir_relations.keys().sorted_by_key(|r| &r.name) {
+   for r in mir.relations_ir_relations.keys().filter(|r| !mir.hidden_relations.contains(r)).sorted_by_key(|r| &r.name) {
       let rel_name = &r.name;
       let rel_name_str = r.name.to_string();
       write_sizes.push(quote! {
@@ -1291,6 +1442,10 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
 
 fn lattice_insertion_mutex_var_name(head_relation: &RelationIdentity) -> Ident {
    Ident::new(&format!("__{}_mutex", head_relation.name), head_relation.name.span())
+}
+
+fn undefined_rel_name(relation: &RelationIdentity) -> Ident {
+   Ident::new(&format!("{}_undefined", relation.name), relation.name.span())
 }
 
 fn rel_ind_common_var_name(relation: &RelationIdentity) -> Ident {

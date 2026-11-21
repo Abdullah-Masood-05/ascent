@@ -8,6 +8,7 @@ mod ascent_codegen;
 mod ascent_syntax;
 mod test_errors;
 mod syn_utils;
+mod well_founded;
 
 #[macro_use]
 extern crate quote;

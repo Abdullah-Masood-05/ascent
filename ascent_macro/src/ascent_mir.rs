@@ -25,6 +25,8 @@ pub(crate) struct AscentMir {
    pub relations_full_indices: HashMap<RelationIdentity, IrRelation>,
    pub relations_metadata: HashMap<RelationIdentity, RelationMetadata>,
    pub lattices_full_indices: HashMap<RelationIdentity, IrRelation>,
+   pub possible_relations: HashMap<RelationIdentity, RelationIdentity>,
+   pub hidden_relations: HashSet<RelationIdentity>,
    pub signatures: Signatures,
    pub config: AscentConfig,
    pub is_parallel: bool,
@@ -35,6 +37,9 @@ pub(crate) struct MirScc {
    pub dynamic_relations: HashMap<RelationIdentity, HashSet<IrRelation>>,
    pub body_only_relations: HashMap<RelationIdentity, HashSet<IrRelation>>,
    pub is_looping: bool,
+   /// Set on the scc deriving the possible facts of a recursion through negation. It is evaluated alternately
+   /// with the next scc, which derives the true facts, until the true facts stop growing.
+   pub alternates_with_next: bool,
 }
 
 pub(crate) fn mir_summary(mir: &AscentMir) -> String {
@@ -226,6 +231,15 @@ fn get_hir_dep_graph(hir: &AscentIr) -> Vec<(usize, usize)> {
          }
       }
    }
+   // possible facts include the true ones; this keeps all rules deriving the possible facts of a recursion through
+   // negation in the scc of the recursion, so that they are rederived whenever the possible facts are recomputed
+   for (rel, possible_rel) in hir.possible_relations.iter().sorted_by_key(|(rel, _)| &rel.name) {
+      if let (Some(rules), Some(possible_rules)) =
+         (relations_to_rules_in_head.get(rel), relations_to_rules_in_head.get(possible_rel))
+      {
+         edges.extend(rules.iter().sorted().cartesian_product(possible_rules.iter().sorted()).map(|(&i, &j)| (i, j)));
+      }
+   }
    edges
 }
 
@@ -239,8 +253,24 @@ pub(crate) fn compile_hir_to_mir(hir: &AscentIr) -> syn::Result<AscentMir> {
    // println!("{:?}", Dot::with_config(&dep_graph, &[Config::EdgeNoLabel]));
    let mut sccs = condensation(dep_graph, true);
 
-   let mut mir_sccs = vec![];
+   let possible_relations = hir.possible_relations.values().collect::<HashSet<_>>();
+   let mut split_sccs = vec![];
+   let mut mir_scc_inds = vec![];
    for scc in sccs.node_weights().collect_vec().iter().rev() {
+      let (possible_rules, rules): (Vec<usize>, Vec<usize>) = scc
+         .iter()
+         .partition(|&&ind| hir.rules[ind].head_clauses.iter().all(|hcl| possible_relations.contains(&hcl.rel)));
+      if !possible_rules.is_empty() && !rules.is_empty() {
+         mir_scc_inds.push(vec![split_sccs.len(), split_sccs.len() + 1]);
+         split_sccs.extend([(possible_rules, true), (rules, false)]);
+      } else {
+         mir_scc_inds.push(vec![split_sccs.len()]);
+         split_sccs.push((scc.to_vec(), false));
+      }
+   }
+
+   let mut mir_sccs = vec![];
+   for (scc, alternates_with_next) in split_sccs {
       let mut dynamic_relations: HashMap<RelationIdentity, HashSet<IrRelation>> = HashMap::new();
       let mut body_only_relations: HashMap<RelationIdentity, HashSet<IrRelation>> = HashMap::new();
 
@@ -291,7 +321,7 @@ pub(crate) fn compile_hir_to_mir(hir: &AscentIr) -> syn::Result<AscentMir> {
             }
          }
       }
-      let mir_scc = MirScc { rules, dynamic_relations, body_only_relations, is_looping };
+      let mir_scc = MirScc { rules, dynamic_relations, body_only_relations, is_looping, alternates_with_next };
       mir_sccs.push(mir_scc);
    }
 
@@ -300,10 +330,11 @@ pub(crate) fn compile_hir_to_mir(hir: &AscentIr) -> syn::Result<AscentMir> {
    let mut sccs_dep_graph = HashMap::with_capacity(sccs_nodes_count);
    for n in sccs.node_indices() {
       //the nodes in the sccs graph is in reverse topological order, so we do this
-      sccs_dep_graph.insert(
-         sccs_nodes_count - n.index() - 1,
-         sccs.neighbors(n).map(|n| sccs_nodes_count - n.index() - 1).collect(),
-      );
+      let inds = &mir_scc_inds[sccs_nodes_count - n.index() - 1];
+      for &ind in inds {
+         let deps = sccs.neighbors(n).flat_map(|n| &mir_scc_inds[sccs_nodes_count - n.index() - 1]);
+         sccs_dep_graph.insert(ind, deps.chain(inds.iter().filter(|&&i| i != ind)).copied().collect());
+      }
    }
 
    Ok(AscentMir {
@@ -312,6 +343,8 @@ pub(crate) fn compile_hir_to_mir(hir: &AscentIr) -> syn::Result<AscentMir> {
       relations_ir_relations: hir.relations_ir_relations.clone(),
       relations_full_indices: hir.relations_full_indices.clone(),
       lattices_full_indices: hir.lattices_full_indices.clone(),
+      possible_relations: hir.possible_relations.clone(),
+      hidden_relations: hir.hidden_relations.clone(),
       relations_metadata: hir.relations_metadata.clone(),
       signatures: hir.signatures.clone(),
       config: hir.config.clone(),

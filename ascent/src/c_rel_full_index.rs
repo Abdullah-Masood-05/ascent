@@ -145,7 +145,12 @@ impl<K: Clone + Hash + Eq, V> RelFullIndexRead<'_> for CRelFullIndex<K, V> {
    type Key = K;
 
    #[inline(always)]
-   fn contains_key(&self, key: &Self::Key) -> bool { self.unwrap_frozen().contains_key(key) }
+   fn contains_key(&self, key: &Self::Key) -> bool {
+      match self {
+         CRelFullIndex::Unfrozen(uf) => uf.contains_key(key),
+         CRelFullIndex::Frozen(f) => f.contains_key(key),
+      }
+   }
 }
 
 impl<K: Clone + Hash + Eq, V> RelFullIndexWrite for CRelFullIndex<K, V> {

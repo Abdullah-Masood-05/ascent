@@ -25,6 +25,7 @@ use crate::utils::{
    Piper, expr_to_ident, expr_to_ident_mut, flatten_punctuated, is_wild_card, pat_to_ident, punctuated_map,
    punctuated_singleton, punctuated_try_map, punctuated_try_unwrap, spans_eq, token_stream_replace_macro_idents,
 };
+use crate::well_founded::desugar_well_founded;
 
 // resources:
 // https://blog.rust-lang.org/2018/12/21/Procedural-Macros-in-Rust-2018.html
@@ -464,6 +465,7 @@ impl AggregatorNode {
    }
 }
 
+#[derive(Clone)]
 pub struct RuleNode {
    pub head_clauses: Punctuated<HeadItemNode, Token![,]>,
    pub body_items: Vec<BodyItemNode>, // Punctuated<BodyItemNode, Token![,]>,
@@ -570,6 +572,10 @@ pub(crate) struct AscentProgram {
    pub signatures: Option<Signatures>,
    pub attributes: Vec<syn::Attribute>,
    pub macros: Vec<MacroDefNode>,
+   /// Maps relations that may hold undefined facts (in `well_founded` programs) to their possible-facts relations
+   pub possible_relations: HashMap<RelationIdentity, RelationIdentity>,
+   /// Relations added for computing the well-founded model
+   pub hidden_relations: HashSet<RelationIdentity>,
 }
 
 /// The output that should be emitted when an `include_source!()` is encountered
@@ -641,7 +647,15 @@ pub(crate) fn parse_ascent_program(
          rules.push(RuleNode::parse(input)?);
       }
    }
-   Ok(Either::Left(AscentProgram { rules, relations, signatures, attributes, macros }))
+   Ok(Either::Left(AscentProgram {
+      rules,
+      relations,
+      signatures,
+      attributes,
+      macros,
+      possible_relations: HashMap::new(),
+      hidden_relations: HashSet::new(),
+   }))
 }
 
 impl Parse for AscentProgram {
@@ -1121,9 +1135,11 @@ pub(crate) fn desugar_ascent_program(mut prog: AscentProgram) -> Result<AscentPr
    let rules_macro_expanded =
       prog.rules.into_iter().map(|r| rule_expand_macro_invocations(r, &macros)).collect::<Result<Vec<_>>>()?;
 
-   prog.rules = rules_macro_expanded
+   prog.rules = rules_macro_expanded.into_iter().flat_map(rule_desugar_disjunction_nodes).collect_vec();
+   desugar_well_founded(&mut prog)?;
+
+   prog.rules = std::mem::take(&mut prog.rules)
       .into_iter()
-      .flat_map(rule_desugar_disjunction_nodes)
       .map(rule_desugar_pattern_args)
       .map(rule_desugar_wildcards)
       .map(rule_desugar_negation)

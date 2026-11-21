@@ -225,6 +225,25 @@ ascent_par! {
 - With **`#![generate_run_timeout]`**, a `run_timeout` function is generated that stops after
   the given amount of time.
 
+- With **`#![well_founded]`**, negation may occur inside recursion, and the program computes its
+  [well-founded model](https://en.wikipedia.org/wiki/Well-founded_semantics) instead of being rejected as non-stratifiable.
+  Every relation `r` holds exactly its true facts. Its public field `r_undefined` (a `Vec` of `r`'s tuple type, without duplicates)
+  holds the facts that are neither true nor false, and `r_truth(&self, &tuple)` returns `ascent::Truth::True`, `Truth::Undefined` or `Truth::False`.
+   ```Rust
+   ascent! {
+      #![well_founded]
+      relation moves(u32, u32);
+      relation win(u32);
+      win(x) <-- moves(x, y), !win(y);
+   }
+   let mut prog = AscentProgram::default();
+   prog.moves = vec![(1, 2), (2, 1), (2, 3), (3, 4)];
+   prog.run();
+   // prog.win holds the winning positions, prog.win_undefined the drawn ones.
+   ```
+   An aggregation over a group that contains undefined facts only has undefined results. For lattices, `r_undefined`
+   pairs each key whose possible value exceeds its true value (or that only has a possible value) with the possible value.
+
 - The feature **`wasm-bindgen`** allows Ascent programs to run in WASM environments.
 
 - **`struct`** declarations can be added to the top of `ascent!` definitions. This allows changing the

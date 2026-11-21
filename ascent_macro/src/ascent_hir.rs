@@ -22,6 +22,7 @@ pub(crate) struct AscentConfig {
    pub include_rule_times: bool,
    pub generate_run_partial: bool,
    pub inter_rule_parallelism: bool,
+   pub well_founded: bool,
    pub default_ds: DsAttributeContents,
 }
 
@@ -29,6 +30,7 @@ impl AscentConfig {
    const MEASURE_RULE_TIMES_ATTR: &'static str = "measure_rule_times";
    const GENERATE_RUN_TIMEOUT_ATTR: &'static str = "generate_run_timeout";
    const INTER_RULE_PARALLELISM_ATTR: &'static str = "inter_rule_parallelism";
+   pub const WELL_FOUNDED_ATTR: &'static str = "well_founded";
 
    pub fn new(attrs: Vec<Attribute>, is_parallel: bool) -> syn::Result<AscentConfig> {
       let include_rule_times = attrs
@@ -48,11 +50,18 @@ impl AscentConfig {
          .find(|attr| attr.meta.path().is_ident(Self::INTER_RULE_PARALLELISM_ATTR))
          .map(|attr| attr.meta.require_path_only())
          .transpose()?;
+      let well_founded = attrs
+         .iter()
+         .find(|attr| attr.meta.path().is_ident(Self::WELL_FOUNDED_ATTR))
+         .map(|attr| attr.meta.require_path_only())
+         .transpose()?
+         .is_some();
 
       let recognized_attrs = [
          Self::MEASURE_RULE_TIMES_ATTR,
          Self::GENERATE_RUN_TIMEOUT_ATTR,
          Self::INTER_RULE_PARALLELISM_ATTR,
+         Self::WELL_FOUNDED_ATTR,
          REL_DS_ATTR,
       ];
       for attr in attrs.iter() {
@@ -74,6 +83,7 @@ impl AscentConfig {
          attrs,
          include_rule_times,
          generate_run_partial,
+         well_founded,
          default_ds,
       })
    }
@@ -84,6 +94,8 @@ pub(crate) struct AscentIr {
    pub relations_full_indices: HashMap<RelationIdentity, IrRelation>,
    pub lattices_full_indices: HashMap<RelationIdentity, IrRelation>,
    pub relations_metadata: HashMap<RelationIdentity, RelationMetadata>,
+   pub possible_relations: HashMap<RelationIdentity, RelationIdentity>,
+   pub hidden_relations: HashSet<RelationIdentity>,
    pub rules: Vec<IrRule>,
    pub signatures: Signatures,
    pub config: AscentConfig,
@@ -217,7 +229,7 @@ impl IrRelation {
    }
 }
 
-const REL_DS_ATTR: &str = "ds";
+pub(crate) const REL_DS_ATTR: &str = "ds";
 const RECOGNIIZED_REL_ATTRS: [&str; 1] = [REL_DS_ATTR];
 
 pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: bool) -> syn::Result<AscentIr> {
@@ -299,6 +311,8 @@ pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: b
       relations_full_indices,
       lattices_full_indices,
       relations_metadata,
+      possible_relations: prog.possible_relations.clone(),
+      hidden_relations: prog.hidden_relations.clone(),
       signatures,
       config,
       is_parallel,

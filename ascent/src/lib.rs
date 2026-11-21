@@ -35,3 +35,12 @@ pub use dashmap;
 #[cfg(feature = "par")]
 pub use rayon;
 pub use {boxcar, hashbrown};
+
+/// The truth value of a fact in the well-founded model computed by Ascent programs with the `#![well_founded]`
+/// attribute
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Truth {
+   True,
+   Undefined,
+   False,
+}

@@ -1,3 +1,7 @@
+## Unreleased
+
+- Added the `#![well_founded]` attribute: negation may occur inside recursion, and the well-founded model is computed (`r_undefined` and `r_truth` are generated for each relation `r`).
+
 ## 0.8.1
 
 - Updated dependencies (instant -> webtime, paste -> pasty) (#75)
