@@ -6,11 +6,11 @@ use proc_macro2::{Ident, Span, TokenStream};
 use syn::spanned::Spanned;
 use syn::{Expr, Type, parse_quote, parse_quote_spanned, parse2};
 
-use crate::ascent_hir::{IndexValType, IrRelation};
+use crate::ascent_hir::{IndexValType, IrAggClause, IrHeadClause, IrRelation};
 use crate::ascent_mir::MirRelationVersion::*;
 use crate::ascent_mir::{
-   AscentMir, MirBodyItem, MirRelation, MirRelationVersion, MirRule, MirScc, ir_relation_version_var_name,
-   mir_rule_summary, mir_summary,
+   AscentMir, MirBodyClause, MirBodyItem, MirRelation, MirRelationVersion, MirRule, MirScc,
+   ir_relation_version_var_name, mir_rule_summary, mir_summary,
 };
 use crate::ascent_syntax::{CondClause, RelationIdentity};
 use crate::utils::{TokenStreamExtensions, exp_cloned, expr_to_ident, tuple, tuple_spanned, tuple_type};
@@ -35,6 +35,21 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
          #rel_ind_common: #rel_ind_common_type,
       });
       field_defaults.push(quote! {#name : Default::default(), #rel_ind_common: Default::default(),});
+      if mir.config.generate_provenance {
+         let rows = provenance_rows_var_name(rel);
+         let row_type = tuple_type(&rel.field_types);
+         relation_fields.push(quote! {
+            #rows: ::ascent::internal::RelFullIndexType<#row_type, usize>,
+         });
+         field_defaults.push(quote! {#rows: Default::default(),});
+         if !rel.is_lattice {
+            let facts = provenance_facts_var_name(rel);
+            relation_fields.push(quote! {
+               #facts: ::std::vec::Vec<#row_type>,
+            });
+            field_defaults.push(quote! {#facts: Default::default(),});
+         }
+      }
       if rel.is_lattice && mir.is_parallel {
          let lattice_mutex_name = lattice_insertion_mutex_var_name(rel);
          relation_fields.push(quote! {
@@ -55,6 +70,13 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
          });
          field_defaults.push(quote! {#name : Default::default(),});
       }
+   }
+
+   if mir.config.generate_provenance {
+      relation_fields.push(quote! {
+         __provenance: ::ascent::internal::Provenance,
+      });
+      field_defaults.push(quote! {__provenance: Default::default(),});
    }
 
    let sccs_ordered = &mir.sccs;
@@ -263,6 +285,14 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
       rel_codegens.push(quote_spanned! { macro_path.span()=> #macro_path::rel_codegen!{#macro_input} });
    }
 
+   let explain_impl = if mir.config.generate_provenance {
+      let row_less_impl = compile_row_less_impl(mir);
+      let explain_impl = compile_explain_impl(mir);
+      quote! { #row_less_impl #explain_impl }
+   } else {
+      quote! {}
+   };
+
    let sccs_count = sccs_ordered.len();
    let res = quote! {
       #(#rel_codegens)*
@@ -308,6 +338,7 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
             #scc_times_summary_body
          }
       }
+      #explain_impl
       impl #impl_impl_generics Default for #struct_name #impl_ty_generics #impl_where_clause {
          fn default() -> Self {
             let mut _self = #struct_name {
@@ -768,6 +799,20 @@ fn compile_update_indices_function_body(mir: &AscentMir) -> proc_macro2::TokenSt
       } else {
          quote! {}
       };
+      if mir.config.generate_provenance {
+         let rows = provenance_rows_var_name(r);
+         update_indices.push(quote_spanned! {r.name.span()=>
+            #_self.#rows.entry(tuple.clone()).or_insert(_i);
+         });
+         // The rows of a row-less relation are the provenance's own, not reindexed from the field
+         let clear_rows = if r.is_lattice {
+            quote_spanned! {r.name.span()=> #_self.#rows.clear(); }
+         } else {
+            let row_less = provenance_row_less(r, &_self, r.name.span());
+            quote_spanned! {r.name.span()=> if !#row_less { #_self.#rows.clear(); } }
+         };
+         res.push(clear_rows);
+      }
       if !par {
          res.push(quote_spanned! {r.name.span()=>
             for (_i, tuple) in #_self.#rel_name.iter().enumerate() {
@@ -786,9 +831,15 @@ fn compile_update_indices_function_body(mir: &AscentMir) -> proc_macro2::TokenSt
       }
    }
 
+   let relocate_derivations = if mir.config.generate_provenance {
+      provenance_relocate_derivations(mir)
+   } else {
+      quote! {}
+   };
    quote! {
       use ascent::internal::ToRelIndex0;
       use #rel_index_write_trait;
+      #relocate_derivations
       #(#res)*
    }
 }
@@ -992,8 +1043,11 @@ fn compile_mir_rule_inner(
 
                let cl1_tuple_indices_iter = quote_spanned!(cl1.rel_args_span=> __cl1_tuple_indices);
 
+               let cl1_row_capture = provenance_row_capture(cl1, &cl1_matched_val_ident, mir);
+               let cl2_row_capture = provenance_row_capture(cl2, &matched_val_ident, mir);
                let mut cl1_conds_then_rest = quote_spanned! {bclause.rel_args_span=>
                   #matching_dot_iter.clone().for_each(|__val|  {
+                     #cl2_row_capture
                      // TODO we may be doing excessive cloning
                      #new_vars_assignments
                      #conds_then_next_loop
@@ -1008,6 +1062,7 @@ fn compile_mir_rule_inner(
                      #(#cl1_join_vars_assignments)*
                      if let Some(__matching) = #cl2_var_name.#index_get(&#joined_args_tuple_for_cl2) {
                         #cl1_tuple_indices_iter.for_each(|cl1_val| {
+                           #cl1_row_capture
                            #(#cl1_vars_assignments)*
                            #cl1_conds_then_rest
                         });
@@ -1015,9 +1070,16 @@ fn compile_mir_rule_inner(
                   });
                }
             } else {
+               let row_capture = provenance_row_capture(bclause, &matched_val_ident, mir);
+               let (key_binding, selected_args_tuple) = provenance_key_binding(
+                  &bclause.rel.indices, &bclause.args, selected_args_tuple, bclause.body_ind, bclause.rel_args_span,
+                  mir,
+               );
                quote_spanned! {bclause.rel_args_span=>
+                  #key_binding
                   if let Some(__matching) = #rel_version_exp.#index_get( &#selected_args_tuple) {
                      #matching_dot_iter.for_each(|__val|  {
+                        #row_capture
                         // TODO we may be doing excessive cloning
                         #new_vars_assignments
                         #conds_then_next_loop
@@ -1066,8 +1128,13 @@ fn compile_mir_rule_inner(
 
             let agg_func = &agg.aggregator;
             let _self = quote! { _self };
+            let (key_binding, selected_args_tuple) =
+               provenance_key_binding(&agg.rel.indices, &agg.rel_args, selected_args_tuple, clause_ind, agg.span, mir);
+            let aggregated_rows = provenance_aggregated_rows(agg, clause_ind, &selected_args_tuple, mir);
             quote_spanned! {agg.span=>
+               #key_binding
                let __aggregated_rel = #rel_expr;
+               #aggregated_rows
                let __matching = __aggregated_rel.index_get( &#selected_args_tuple);
                let __agg_args = __matching.into_iter().flatten().map(|__val| {
                   #vars_assignments
@@ -1195,6 +1262,19 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
          }
       };
 
+      let push_code = if mir.config.generate_provenance && !head_relation.is_lattice {
+         provenance_push_code(hcl)
+      } else {
+         push_code
+      };
+      let HeadProvenanceCode {
+         record_derivation,
+         save_lattice_row,
+         track_lattice_row,
+         track_new_lattice_row,
+         track_new_row,
+      } = head_provenance_code(rule, hcl, mir);
+
       if !hcl.rel.is_lattice {
          let add_row = quote_spanned! {hcl.span=>
             let __new_row: #row_type = #new_row_tuple;
@@ -1205,7 +1285,9 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
                   &__new_row, ())
                {
                   #push_code
+                  #record_derivation
                   #(#update_indices)*
+                  #track_new_row
                   #set_changed_true_code
                }
             }
@@ -1238,17 +1320,22 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
                   .or_else(|| #head_lat_full_index_var_name_full.index_get(&__lattice_key))
                {
                   let __existing_ind = *__existing_ind.next().unwrap();
+                  #save_lattice_row
                   // TODO possible excessive cloning here?
                   let __lat_changed = ::ascent::Lattice::join_mut(&mut #_self.#head_rel_name[__existing_ind].#tuple_lat_index, __new_row.#tuple_lat_index.clone());
                   if __lat_changed {
                      let __new_row_ind = __existing_ind;
+                     #track_lattice_row
+                     #record_derivation
                      #(#update_indices)*
                      #set_changed_true_code
                   }
                } else {
                   let __new_row_ind = #_self.#head_rel_name.len();
+                  #record_derivation
                   #(#update_indices)*
                   #_self.#head_rel_name.push(#new_row_to_be_pushed);
+                  #track_new_lattice_row
                   #set_changed_true_code
                }
             }
@@ -1287,6 +1374,590 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
       }
    }
    quote! {#(#add_rows)*}
+}
+
+/// The provenance code woven into the insertion code of a head clause by [`head_update_code`].
+/// Each stream refers to the locals of the insertion code around it, and is empty without
+/// `#![generate_provenance]` or where it does not apply.
+#[derive(Default)]
+struct HeadProvenanceCode {
+   /// Records the derivation of the fact at `__new_row_ind` from the facts the rule matched
+   record_derivation: TokenStream,
+   /// Saves the lattice fact at `__existing_ind` as `__old_row` before its value is joined
+   save_lattice_row: TokenStream,
+   /// Remaps the lattice fact at `__new_row_ind`, whose value the join changed, from `__old_row`
+   track_lattice_row: TokenStream,
+   /// Maps the lattice fact just pushed at `__new_row_ind` to its row
+   track_new_lattice_row: TokenStream,
+   /// Maps the relation fact `__new_row`, just pushed at `__new_row_ind`, to its row
+   track_new_row: TokenStream,
+}
+
+/// The provenance code of the insertion of the facts of `hcl`, the head clause of `rule`.
+fn head_provenance_code(rule: &MirRule, hcl: &IrHeadClause, mir: &AscentMir) -> HeadProvenanceCode {
+   if !mir.config.generate_provenance {
+      return HeadProvenanceCode::default();
+   }
+   let head_relation = &hcl.rel;
+   let head_rel_name = Ident::new(&hcl.rel.name.to_string(), hcl.span);
+   let rows = provenance_rows_var_name(head_relation);
+   let self_tok = quote! { _self };
+   // The provenance code refers to the locals of the insertion code around it, so it is spanned
+   // like their definitions: at the call site for relations, at the head clause for lattices
+   let local_span = if head_relation.is_lattice { hcl.span } else { Span::call_site() };
+
+   let rel_id = mir.provenance_relations.id(head_relation);
+   let origin = rule.origin;
+   let premises_var = Ident::new("__premises", local_span);
+   let label = syn::Lifetime::new("'__provenance_premises", local_span);
+   let premises = provenance_premises(rule, mir, &premises_var, &label);
+   // A premise has no row when the rule matched a fact the user removed, which the
+   // indices of the previous run still hold
+   let (record, otherwise) = if head_relation.is_lattice {
+      (
+         quote! { record_latest },
+         quote_spanned! {local_span=> #self_tok.__provenance.forget(#rel_id, __new_row_ind); },
+      )
+   } else {
+      (quote! { record }, quote! {})
+   };
+   // A block rather than a closure, so that the premises can be looked up and registered
+   // in the row maps while the matched facts are borrowed from `_self`
+   let record_derivation = quote_spanned! {local_span=>
+      #[allow(unused_labels)]
+      let #premises_var = #label: {
+         let mut #premises_var = ::std::vec::Vec::new();
+         #(#premises)*
+         ::std::option::Option::Some(#premises_var)
+      };
+      match #premises_var {
+         ::std::option::Option::Some(#premises_var) =>
+            #self_tok.__provenance.#record(#rel_id, __new_row_ind, #origin, #premises_var),
+         ::std::option::Option::None => { #otherwise }
+      }
+   };
+
+   if !head_relation.is_lattice {
+      // The whole of `__new_row` is kept for the row map, which it is moved into once the indices
+      // are updated
+      let new_row = Ident::new("__new_row", hcl.span);
+      let track_new_row = quote_spanned! {local_span=> #self_tok.#rows.insert(#new_row, __new_row_ind); };
+      return HeadProvenanceCode { record_derivation, track_new_row, ..Default::default() };
+   }
+
+   // Keeps the row map of a lattice up to date as the values of its facts change, leaving the old
+   // value mapped if its entry names another row.
+   let save_lattice_row =
+      quote_spanned! {local_span=> let __old_row = #self_tok.#head_rel_name[__existing_ind].clone(); };
+   let track_lattice_row = quote_spanned! {local_span=>
+      if #self_tok.#rows.get(&__old_row) == ::std::option::Option::Some(&__new_row_ind) {
+         #self_tok.#rows.remove(&__old_row);
+      }
+      #self_tok.#rows.insert(#self_tok.#head_rel_name[__new_row_ind].clone(), __new_row_ind);
+   };
+   let track_new_lattice_row = quote_spanned! {local_span=>
+      #self_tok.#rows.insert(#self_tok.#head_rel_name[__new_row_ind].clone(), __new_row_ind);
+   };
+   HeadProvenanceCode {
+      record_derivation,
+      save_lattice_row,
+      track_lattice_row,
+      track_new_lattice_row,
+      track_new_row: quote! {},
+   }
+}
+
+/// The push of `__new_row` to the relation of `hcl` in a program with provenance, binding its row
+/// to `__new_row_ind`. A row-less relation, whose `push` leaves the field as it was, gets its
+/// facts numbered by the provenance's own list of them instead; a field that stores rows grows by
+/// the pushed row, as the generated code reads it back by its index, so the rows of the default
+/// providers are always the relation's.
+fn provenance_push_code(hcl: &IrHeadClause) -> TokenStream {
+   let head_rel_name = Ident::new(&hcl.rel.name.to_string(), hcl.span);
+   let facts = provenance_facts_var_name(&hcl.rel);
+   let new_row = Ident::new("__new_row", hcl.span);
+   quote! {
+      let __new_row_ind = _self.#head_rel_name.len();
+      _self.#head_rel_name.push(#new_row.clone());
+      let __new_row_ind = if _self.#head_rel_name.len() > __new_row_ind {
+         __new_row_ind
+      } else {
+         let __new_row_ind = _self.#facts.len();
+         _self.#facts.push(#new_row.clone());
+         __new_row_ind
+      };
+   }
+}
+
+/// The field mapping the facts of a relation or lattice to their rows.
+fn provenance_rows_var_name(relation: &RelationIdentity) -> Ident {
+   Ident::new(&format!("__{}_provenance_rows", relation.name), relation.name.span())
+}
+
+/// The field listing the facts of a relation, by row, when its data structure provider stores no
+/// rows. Empty, and the rows those of the relation, otherwise.
+fn provenance_facts_var_name(relation: &RelationIdentity) -> Ident {
+   Ident::new(&format!("__{}_provenance_facts", relation.name), relation.name.span())
+}
+
+/// The method telling whether a relation is row-less, generated by [`compile_row_less_impl`].
+fn provenance_row_less_fn_name(relation: &RelationIdentity) -> Ident {
+   Ident::new(&format!("__{}_provenance_row_less", relation.name), relation.name.span())
+}
+
+/// Whether `relation`, which is not a lattice, is row-less, as told by its generated method.
+fn provenance_row_less(relation: &RelationIdentity, self_tok: &TokenStream, span: Span) -> TokenStream {
+   let row_less = provenance_row_less_fn_name(relation);
+   quote_spanned! {span=> #self_tok.#row_less() }
+}
+
+/// The `__<relation>_provenance_row_less` methods of a program with provenance, one per relation
+/// that is not a lattice: the single place that tells a row-less relation from one whose data
+/// structure stores rows.
+fn compile_row_less_impl(mir: &AscentMir) -> TokenStream {
+   let (impl_generics, ty_generics, where_clause) = mir.signatures.split_impl_generics_for_impl();
+   let struct_name = &mir.signatures.declaration.ident;
+   let row_less_fns = mir.provenance_relations.relations().iter().filter(|rel| !rel.is_lattice).map(|rel| {
+      let row_less = provenance_row_less_fn_name(rel);
+      let facts = provenance_facts_var_name(rel);
+      let doc = format!(
+         "Whether `{name}` is row-less: backed by a data structure provider whose field stores no \
+          rows, so that its facts are numbered by `{facts}`, the provenance's own list of them. \
+          The list, not a flag, is the source of truth: a fact is appended to it exactly when a \
+          `push` left the field as it was, so it is non-empty if and only if the relation is \
+          row-less and holds facts, and a row-less relation without facts has no rows to number.",
+         name = rel.name
+      );
+      quote! {
+         #[doc = #doc]
+         fn #row_less(&self) -> bool { !self.#facts.is_empty() }
+      }
+   });
+   quote! {
+      impl #impl_generics #struct_name #ty_generics #where_clause {
+         #(#row_less_fns)*
+      }
+   }
+}
+
+/// The fact at `row` of `relation`, if the relation has such a row.
+fn provenance_stored_row(relation: &RelationIdentity, self_tok: &TokenStream, row: &Ident, span: Span) -> TokenStream {
+   let name = &relation.name;
+   quote_spanned! {span=> (#row < #self_tok.#name.len()).then(|| &#self_tok.#name[#row]) }
+}
+
+/// The row of `fact`, a fact a clause or aggregation matched in `relation`, evaluating to `missing`
+/// if it has none. A fact of a row-less relation is given a row if it has none yet: the data
+/// structure can hold facts no rule derived, such as those a transitive relation implies, which
+/// are explained as leaves. A fact without a row of a relation that stores rows was removed by
+/// the user and only matched from the indices of the previous run.
+fn provenance_fact_row(
+   relation: &RelationIdentity, fact: TokenStream, missing: TokenStream, span: Span,
+) -> TokenStream {
+   let rows = provenance_rows_var_name(relation);
+   let facts = provenance_facts_var_name(relation);
+   let self_tok = quote! { _self };
+   let row_less = provenance_row_less(relation, &self_tok, span);
+   let register = quote_spanned! {span=>
+      {
+         let __row = #self_tok.#facts.len();
+         #self_tok.#facts.push(__fact.clone());
+         #self_tok.#rows.insert(__fact, __row);
+         __row
+      }
+   };
+   quote_spanned! {span=>
+      {
+         let __fact = #fact;
+         let __row = #self_tok.#rows.get(&__fact).copied();
+         match __row {
+            ::std::option::Option::Some(__row) => __row,
+            ::std::option::Option::None if #row_less => #register,
+            ::std::option::Option::None => #missing,
+         }
+      }
+   }
+}
+
+fn provenance_row_var_name(bclause: &MirBodyClause) -> Ident {
+   Ident::new(&format!("__provenance_row_{}", bclause.body_ind), bclause.rel_args_span)
+}
+
+fn provenance_aggregated_rows_var_name(body_ind: usize, span: Span) -> Ident {
+   Ident::new(&format!("__provenance_rows_{body_ind}"), span)
+}
+
+/// Collects the `(relation id, row)` pairs of the facts the aggregation at `body_ind` aggregates.
+fn provenance_aggregated_rows(agg: &IrAggClause, body_ind: usize, key: &Expr, mir: &AscentMir) -> TokenStream {
+   if !mir.config.generate_provenance {
+      return quote! {};
+   }
+   let relation = &agg.rel.relation;
+   let rel_id = mir.provenance_relations.id(relation);
+   let rows_var = provenance_aggregated_rows_var_name(body_ind, agg.span);
+   // Spanned like the aggregation code around it, whose locals it refers to
+   let span = agg.span;
+   let label = syn::Lifetime::new(&format!("'__provenance_rows_{body_ind}"), span);
+   let missing = quote_spanned! {span=> break #label ::std::option::Option::None };
+   let row = match &agg.rel.val_type {
+      IndexValType::Reference => {
+         let selected = agg
+            .rel
+            .indices
+            .iter()
+            .map(|&i| (i, provenance_matched_column(&agg.rel.indices, &agg.rel_args, i, body_ind, span)))
+            .collect_vec();
+         let row = provenance_lattice_row(relation, &selected, quote_spanned! {span=> *__val }, span);
+         quote_spanned! {span=>
+            match #row {
+               ::std::option::Option::Some(__row) => __row,
+               ::std::option::Option::None => #missing,
+            }
+         }
+      },
+      IndexValType::Direct(val_cols) => {
+         let fact = (0..relation.field_types.len())
+            .map(|i| match val_cols.iter().position(|&col| col == i) {
+               Some(pos) => {
+                  let pos = syn::Index::from(pos);
+                  parse_quote_spanned! {span=> __val.#pos.clone()}
+               },
+               None => provenance_matched_column(&agg.rel.indices, &agg.rel_args, i, body_ind, span),
+            })
+            .collect_vec();
+         let fact = tuple_spanned(&fact, agg.span);
+         let fact = quote_spanned! {span=>
+            {
+               let __val = __val.tuple_of_borrowed();
+               #fact
+            }
+         };
+         provenance_fact_row(relation, fact, missing, span)
+      },
+   };
+   // A block rather than an iterator, so that the facts can be registered in the row map while
+   // the matched facts are borrowed from `_self`
+   quote_spanned! {span=>
+      let #rows_var: ::std::option::Option<::std::vec::Vec<(usize, usize)>> = #label: {
+         let mut #rows_var = ::std::vec::Vec::new();
+         for __val in __aggregated_rel.index_get(&#key).into_iter().flatten() {
+            #rows_var.push((#rel_id, #row));
+         }
+         ::std::option::Option::Some(#rows_var)
+      };
+   }
+}
+
+/// The local holding the index key the clause or aggregation at `body_ind` looked its facts up by.
+fn provenance_key_var_name(body_ind: usize, span: Span) -> Ident {
+   Ident::new(&format!("__provenance_key_{body_ind}"), span)
+}
+
+/// Binds the index key `key` of a clause or aggregation to a local when provenance needs the
+/// value of one of its non-variable columns, so that the expression is evaluated only once.
+/// Returns the binding and the expression to look facts up by.
+fn provenance_key_binding(
+   indices: &[usize], args: &[Expr], key: Expr, body_ind: usize, span: Span, mir: &AscentMir,
+) -> (TokenStream, Expr) {
+   if mir.config.generate_provenance && indices.iter().any(|&i| expr_to_ident(&args[i]).is_none()) {
+      let key_var = provenance_key_var_name(body_ind, span);
+      (quote_spanned! {span=> let #key_var = #key; }, parse_quote! { #key_var })
+   } else {
+      (quote! {}, key)
+   }
+}
+
+/// Column `i` of the fact the clause or aggregation at `body_ind` matched: a clone of its
+/// variable, or the column of the key bound by `provenance_key_binding`.
+fn provenance_matched_column(indices: &[usize], args: &[Expr], i: usize, body_ind: usize, span: Span) -> Expr {
+   match indices.iter().position(|&col| col == i) {
+      Some(pos) if expr_to_ident(&args[i]).is_none() => {
+         let key_var = provenance_key_var_name(body_ind, span);
+         let pos = syn::Index::from(pos);
+         parse_quote_spanned! {span=> #key_var.#pos.clone() }
+      },
+      _ => exp_cloned(&args[i]),
+   }
+}
+
+/// The row of a lattice fact a clause matched, or `None` if that row no longer holds a fact with
+/// the `selected` column values the clause looked it up by. Indices are not cleared between runs,
+/// so a rerun can match a row whose fact the user replaced. The row is named as the fact's mapped
+/// row, as relation facts are. A lattice holds one row per key; a key the user supplied at several
+/// rows is not supported, by the engine either.
+fn provenance_lattice_row(
+   relation: &RelationIdentity, selected: &[(usize, Expr)], row: TokenStream, span: Span,
+) -> TokenStream {
+   let rows = provenance_rows_var_name(relation);
+   let self_tok = quote! { _self };
+   let columns_match = selected.iter().map(|(i, column)| {
+      let i = syn::Index::from(*i);
+      quote_spanned! {span=> __fact.#i == #column }
+   });
+   let columns_match = if selected.is_empty() {
+      quote_spanned! {span=> true }
+   } else {
+      quote_spanned! {span=> #(#columns_match)&&* }
+   };
+   let mapped_row = quote_spanned! {span=>
+      if #columns_match { #self_tok.#rows.get(__fact).copied() } else { ::std::option::Option::None }
+   };
+   let row_ident = Ident::new("__row", span);
+   let stored_row = provenance_stored_row(relation, &self_tok, &row_ident, span);
+   quote_spanned! {span=>
+      {
+         let #row_ident: usize = #row;
+         #stored_row.and_then(|__fact| #mapped_row)
+      }
+   }
+}
+
+/// Saves the row of the fact a lattice clause matched. The rows of other facts are found from
+/// the clause arguments once the rule fires, as their indices do not refer to rows.
+fn provenance_row_capture(bclause: &MirBodyClause, val_ident: &Ident, mir: &AscentMir) -> TokenStream {
+   if mir.config.generate_provenance && bclause.rel.relation.is_lattice {
+      let row = provenance_row_var_name(bclause);
+      quote! { let #row: usize = *#val_ident; }
+   } else {
+      quote! {}
+   }
+}
+
+/// Pushes to `premises` the `(relation id, row)` pairs of the facts the relation clauses and
+/// aggregations of `rule` matched, in source order, breaking out of the enclosing block `label`
+/// with `None` if one of them has no row. `rule` must not have been reordered.
+fn provenance_premises(rule: &MirRule, mir: &AscentMir, premises: &Ident, label: &syn::Lifetime) -> Vec<TokenStream> {
+   let missing = quote! { break #label ::std::option::Option::None };
+   rule
+      .body_items
+      .iter()
+      .enumerate()
+      .filter_map(|(body_ind, bitem)| match bitem {
+         MirBodyItem::Clause(bclause) => {
+            let relation = &bclause.rel.relation;
+            let rel_id = mir.provenance_relations.id(relation);
+            let matched_column = |i| {
+               provenance_matched_column(
+                  &bclause.rel.indices, &bclause.args, i, bclause.body_ind, bclause.rel_args_span,
+               )
+            };
+            let row = if relation.is_lattice {
+               let row = provenance_row_var_name(bclause);
+               let selected = bclause.rel.indices.iter().map(|&i| (i, matched_column(i))).collect_vec();
+               let row = provenance_lattice_row(relation, &selected, quote! { #row }, Span::call_site());
+               quote! {
+                  match #row {
+                     ::std::option::Option::Some(__row) => __row,
+                     ::std::option::Option::None => #missing,
+                  }
+               }
+            } else {
+               let fact = tuple_spanned(&(0..bclause.args.len()).map(matched_column).collect_vec(), bclause.args_span);
+               provenance_fact_row(relation, quote! { #fact }, missing.clone(), Span::call_site())
+            };
+            Some(quote! { #premises.push((#rel_id, #row)); })
+         },
+         MirBodyItem::Agg(agg) => {
+            let rows_var = provenance_aggregated_rows_var_name(body_ind, agg.span);
+            Some(quote! {
+               match #rows_var.as_ref() {
+                  ::std::option::Option::Some(__rows) => #premises.extend(__rows.iter().copied()),
+                  ::std::option::Option::None => #missing,
+               }
+            })
+         },
+         MirBodyItem::Generator(_) | MirBodyItem::Cond(_) => None,
+      })
+      .collect()
+}
+
+/// Moves the derivations of facts the user moved since the last run, and forgets those of
+/// facts the user removed or that were derived from them. Runs before the rows of the facts are
+/// reindexed.
+fn provenance_relocate_derivations(mir: &AscentMir) -> TokenStream {
+   let relations = mir.provenance_relations.relations();
+   let self_tok = quote! { self };
+   let mut find_moved = vec![];
+   for (rel_id, rel) in relations.iter().enumerate() {
+      let name = &rel.name;
+      let rows = provenance_rows_var_name(rel);
+      let find_moved_in_rel = quote! {
+         let mut __new_rows = ::std::collections::HashMap::new();
+         for (row, fact) in self.#name.iter().enumerate() {
+            __new_rows.entry(fact).or_insert(row);
+         }
+         for (fact, &row) in self.#rows.iter() {
+            let new_row = __new_rows.get(fact).copied();
+            if new_row != ::std::option::Option::Some(row) {
+               __moved.insert((#rel_id, row), new_row);
+            }
+         }
+      };
+      // The user cannot move the facts of a row-less relation
+      find_moved.push(if rel.is_lattice {
+         find_moved_in_rel
+      } else {
+         let row_less = provenance_row_less(rel, &self_tok, Span::call_site());
+         quote! { if !#row_less { #find_moved_in_rel } }
+      });
+   }
+   // The rows of a row-less relation are numbered by the provenance's list of its facts
+   let lens = relations.iter().map(|rel| {
+      let name = &rel.name;
+      if rel.is_lattice {
+         quote! { self.#name.len() }
+      } else {
+         let facts = provenance_facts_var_name(rel);
+         let row_less = provenance_row_less(rel, &self_tok, Span::call_site());
+         quote! { if #row_less { self.#facts.len() } else { self.#name.len() } }
+      }
+   });
+   quote! {
+      let mut __moved = ::std::collections::HashMap::new();
+      #(#find_moved)*
+      let __relocation = ::ascent::internal::Relocation { lens: &[#(#lens),*], moved: &__moved };
+      self.__provenance.relocate(&__relocation);
+   }
+}
+
+/// The `explain_<relation>` functions of a program with provenance.
+fn compile_explain_impl(mir: &AscentMir) -> TokenStream {
+   let (impl_generics, ty_generics, where_clause) = mir.signatures.split_impl_generics_for_impl();
+   let struct_name = &mir.signatures.declaration.ident;
+   let relations = mir.provenance_relations.relations();
+
+   let mut where_clause = where_clause.cloned().unwrap_or_else(|| parse_quote! { where });
+   for field_type in relations.iter().flat_map(|rel| &rel.field_types).unique() {
+      where_clause.predicates.push(parse_quote! { #field_type: ::core::fmt::Debug });
+   }
+
+   let mut explain_fns = vec![];
+   let mut fact_arms = vec![];
+   for (rel_id, rel) in relations.iter().enumerate() {
+      let name = &rel.name;
+      let name_str = name.to_string();
+      let is_lattice = rel.is_lattice;
+      let rows = provenance_rows_var_name(rel);
+      let row_from_map = quote! { self.#rows.get(fact).copied() };
+      let self_tok = quote! { self };
+      let row_ident = Ident::new("row", Span::call_site());
+      let stored_row = provenance_stored_row(rel, &self_tok, &row_ident, Span::call_site());
+      // The facts of a row-less relation are listed by the provenance and never moved or removed
+      // by the user; the full index answers whether it holds a fact
+      let (listed_fact, in_index, or_in_index) = if rel.is_lattice {
+         (quote! {}, quote! {}, quote! {})
+      } else {
+         let facts = provenance_facts_var_name(rel);
+         let row_less = provenance_row_less(rel, &self_tok, Span::call_site());
+         let full_index = &mir.relations_full_indices[rel].ir_name();
+         let ind_common = rel_ind_common_var_name(rel);
+         (
+            quote! {
+               if #row_less {
+                  return self.#facts.get(row).map(|fact| (#name_str, ::std::format!("{:?}", fact), false));
+               }
+            },
+            quote! {
+               // Row-less, so that the field stores no facts and the full index holds them instead
+               let in_index = || #row_less
+                  && ::ascent::internal::RelFullIndexRead::contains_key(
+                     &::ascent::internal::ToRelIndex0::to_rel_index(&self.#full_index, &self.#ind_common),
+                     fact,
+                  );
+            },
+            quote! { || in_index() },
+         )
+      };
+      fact_arms.push(quote! {
+         #rel_id => {
+            #listed_fact
+            let in_place = #stored_row.and_then(|fact| {
+               (#row_from_map == ::std::option::Option::Some(row)).then(|| ::std::format!("{:?}", fact))
+            });
+            let fact = match in_place {
+               ::std::option::Option::Some(fact) => fact,
+               // The user moved or removed the fact since the last run
+               ::std::option::Option::None => {
+                  let fact = self.#rows.iter().find(|(_, fact_row)| **fact_row == row)?.0;
+                  if !self.#name.iter().any(|row| row == fact) {
+                     return ::std::option::Option::None;
+                  }
+                  ::std::format!("{:?}", fact)
+               },
+            };
+            ::std::option::Option::Some((#name_str, fact, #is_lattice))
+         },
+      });
+      let explain_fn = Ident::new(&format!("explain_{name}"), name.span());
+      let row_type = tuple_type(&rel.field_types);
+      let doc = format!(
+         "Explains how the fact `fact` of `{name}` was derived, or returns `None` if `{name}` does not contain it."
+      );
+      explain_fns.push(quote! {
+         #[doc = #doc]
+         pub fn #explain_fn(&self, fact: &#row_type) -> ::std::option::Option<::ascent::provenance::Proof> {
+            let row = #row_from_map;
+            // In place at its mapped row, where the last run left it
+            let at_mapped_row = row.and_then(|row| #stored_row).is_some_and(|row| row == fact);
+            // Elsewhere in the field: added, or moved, by the user since the last run
+            let in_field = || self.#name.iter().any(|row| row == fact);
+            #in_index
+            if !(at_mapped_row || in_field() #or_in_index) {
+               return ::std::option::Option::None;
+            }
+            match row {
+               // Possibly moved by the user since the last run
+               ::std::option::Option::Some(row) => self.__explain(#rel_id, row),
+               // A fact added since the last run
+               ::std::option::Option::None => ::std::option::Option::Some(::ascent::provenance::Proof {
+                  relation: #name_str,
+                  fact: ::std::format!("{:?}", fact),
+                  rule: ::std::option::Option::None,
+                  premises: ::std::vec::Vec::new(),
+               }),
+            }
+         }
+      });
+   }
+
+   quote! {
+      impl #impl_generics #struct_name #ty_generics #where_clause {
+         #(#explain_fns)*
+
+         /// The name of `relation`, the fact the last run recorded at `row` of it, and whether it is a
+         /// lattice, or `None` if the user has removed that fact since. Rows refer to the relations
+         /// as they were after the last run: the user may have moved facts since, in which case the
+         /// fact is found by a scan of the relation. The rows of a relation whose data structure
+         /// stores no rows refer to the provenance's list of its facts.
+         fn __provenance_fact(
+            &self, relation: usize, row: usize,
+         ) -> ::std::option::Option<(&'static str, ::std::string::String, bool)> {
+            match relation {
+               #(#fact_arms)*
+               _ => unreachable!("unknown relation id"),
+            }
+         }
+
+         /// The proof of the fact the last run recorded at `row` of `relation`. A lattice fact is only
+         /// explained at the root: as a premise, its value may have changed since it was matched. A
+         /// derivation one of whose premises the user removed since the last run is not used.
+         fn __explain(&self, relation: usize, row: usize) -> ::std::option::Option<::ascent::provenance::Proof> {
+            ::ascent::internal::build_proof(relation, row, |relation, row, is_root| {
+               let (relation_name, fact, is_lattice) = self.__provenance_fact(relation, row)?;
+               let derivation = if is_lattice && !is_root {
+                  ::std::option::Option::None
+               } else {
+                  self.__provenance.derivation(relation, row)
+               };
+               let derivation = derivation.filter(|derivation| {
+                  derivation.premises.iter().all(|&(relation, row)| self.__provenance_fact(relation, row).is_some())
+               });
+               let node = ::ascent::internal::ProofNode { relation: relation_name, fact, derivation };
+               ::std::option::Option::Some(node)
+            })
+         }
+      }
+   }
 }
 
 fn lattice_insertion_mutex_var_name(head_relation: &RelationIdentity) -> Ident {

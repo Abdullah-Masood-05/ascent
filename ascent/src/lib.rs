@@ -7,6 +7,8 @@ pub mod internal;
 #[doc(hidden)]
 pub mod rel;
 pub mod aggregators;
+pub mod provenance;
+mod provenance_store;
 mod convert;
 mod rel_index_read;
 mod exps;

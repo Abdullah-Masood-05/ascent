@@ -225,6 +225,21 @@ ascent_par! {
 - With **`#![generate_run_timeout]`**, a `run_timeout` function is generated that stops after
   the given amount of time.
 
+- With **`#![generate_provenance]`** (`ascent!` and `ascent_run!` only), an `explain_<relation>(&fact)` method is
+  generated for each relation. It returns `None` if the fact is absent, otherwise an `ascent::provenance::Proof`
+  with the fact, the position of the rule that derived it (`None` for user-supplied facts) and the proofs of the facts
+  the rule matched. Relations keep their first derivation, lattices the one that last changed the value.
+   ```Rust
+   ascent! {
+      #![generate_provenance]
+      relation edge(i32, i32);
+      relation path(i32, i32);
+      path(x, y) <-- edge(x, y);                 // rule 0
+      path(x, z) <-- edge(x, y), path(y, z);     // rule 1
+   }
+   let proof = prog.explain_path(&(1, 3)).unwrap();  // proof.rule == Some(1), proof.premises: edge(1, 2), path(2, 3)
+   ```
+
 - The feature **`wasm-bindgen`** allows Ascent programs to run in WASM environments.
 
 - **`struct`** declarations can be added to the top of `ascent!` definitions. This allows changing the

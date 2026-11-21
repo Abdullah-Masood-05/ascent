@@ -566,6 +566,8 @@ pub struct IncludeSourceNode {
 // #[derive(Clone)]
 pub(crate) struct AscentProgram {
    pub rules: Vec<RuleNode>,
+   /// For each rule, the position of the rule it was desugared from in the program source
+   pub rule_origins: Vec<usize>,
    pub relations: Vec<RelationNode>,
    pub signatures: Option<Signatures>,
    pub attributes: Vec<syn::Attribute>,
@@ -641,7 +643,8 @@ pub(crate) fn parse_ascent_program(
          rules.push(RuleNode::parse(input)?);
       }
    }
-   Ok(Either::Left(AscentProgram { rules, relations, signatures, attributes, macros }))
+   let rule_origins = (0..rules.len()).collect();
+   Ok(Either::Left(AscentProgram { rules, rule_origins, relations, signatures, attributes, macros }))
 }
 
 impl Parse for AscentProgram {
@@ -1121,14 +1124,15 @@ pub(crate) fn desugar_ascent_program(mut prog: AscentProgram) -> Result<AscentPr
    let rules_macro_expanded =
       prog.rules.into_iter().map(|r| rule_expand_macro_invocations(r, &macros)).collect::<Result<Vec<_>>>()?;
 
-   prog.rules = rules_macro_expanded
+   (prog.rule_origins, prog.rules) = rules_macro_expanded
       .into_iter()
-      .flat_map(rule_desugar_disjunction_nodes)
-      .map(rule_desugar_pattern_args)
-      .map(rule_desugar_wildcards)
-      .map(rule_desugar_negation)
-      .map(rule_desugar_repeated_vars)
-      .collect_vec();
+      .zip(prog.rule_origins)
+      .flat_map(|(rule, origin)| rule_desugar_disjunction_nodes(rule).into_iter().map(move |rule| (origin, rule)))
+      .map(|(origin, rule)| (origin, rule_desugar_pattern_args(rule)))
+      .map(|(origin, rule)| (origin, rule_desugar_wildcards(rule)))
+      .map(|(origin, rule)| (origin, rule_desugar_negation(rule)))
+      .map(|(origin, rule)| (origin, rule_desugar_repeated_vars(rule)))
+      .unzip();
 
    Ok(prog)
 }

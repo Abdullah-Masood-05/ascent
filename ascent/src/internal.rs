@@ -10,6 +10,7 @@ use rustc_hash::FxHasher;
 pub use web_time::Instant;
 
 pub use crate::convert::*;
+pub use crate::provenance_store::{Derivation, ProofNode, Provenance, Relocation, build_proof};
 pub use crate::rel_index_read::{RelIndexCombined, RelIndexRead, RelIndexReadAll};
 
 pub type RelIndexType<K> = RelIndexType1<K, usize>;

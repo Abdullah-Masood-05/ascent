@@ -22,6 +22,7 @@ pub(crate) struct AscentConfig {
    pub include_rule_times: bool,
    pub generate_run_partial: bool,
    pub inter_rule_parallelism: bool,
+   pub generate_provenance: bool,
    pub default_ds: DsAttributeContents,
 }
 
@@ -29,6 +30,7 @@ impl AscentConfig {
    const MEASURE_RULE_TIMES_ATTR: &'static str = "measure_rule_times";
    const GENERATE_RUN_TIMEOUT_ATTR: &'static str = "generate_run_timeout";
    const INTER_RULE_PARALLELISM_ATTR: &'static str = "inter_rule_parallelism";
+   const GENERATE_PROVENANCE_ATTR: &'static str = "generate_provenance";
 
    pub fn new(attrs: Vec<Attribute>, is_parallel: bool) -> syn::Result<AscentConfig> {
       let include_rule_times = attrs
@@ -48,11 +50,17 @@ impl AscentConfig {
          .find(|attr| attr.meta.path().is_ident(Self::INTER_RULE_PARALLELISM_ATTR))
          .map(|attr| attr.meta.require_path_only())
          .transpose()?;
+      let generate_provenance = attrs
+         .iter()
+         .find(|attr| attr.meta.path().is_ident(Self::GENERATE_PROVENANCE_ATTR))
+         .map(|attr| attr.meta.require_path_only())
+         .transpose()?;
 
       let recognized_attrs = [
          Self::MEASURE_RULE_TIMES_ATTR,
          Self::GENERATE_RUN_TIMEOUT_ATTR,
          Self::INTER_RULE_PARALLELISM_ATTR,
+         Self::GENERATE_PROVENANCE_ATTR,
          REL_DS_ATTR,
       ];
       for attr in attrs.iter() {
@@ -67,10 +75,16 @@ impl AscentConfig {
       if inter_rule_parallelism.is_some() && !is_parallel {
          return Err(Error::new_spanned(inter_rule_parallelism, "attribute only allowed in parallel Ascent"));
       }
+      if generate_provenance.is_some() && is_parallel {
+         return Err(Error::new_spanned(
+            generate_provenance, "`generate_provenance` is not supported by `ascent_par!` and `ascent_run_par!`",
+         ));
+      }
       let default_ds = get_ds_attr(&attrs)?
          .unwrap_or_else(|| DsAttributeContents { path: parse_quote! {::ascent::rel}, args: TokenStream::default() });
       Ok(AscentConfig {
          inter_rule_parallelism: inter_rule_parallelism.is_some(),
+         generate_provenance: generate_provenance.is_some(),
          attrs,
          include_rule_times,
          generate_run_partial,
@@ -99,6 +113,8 @@ pub(crate) struct RelationMetadata {
 }
 
 pub(crate) struct IrRule {
+   /// The position of the rule in the program source this rule was desugared from
+   pub origin: usize,
    pub head_clauses: Vec<IrHeadClause>,
    pub body_items: Vec<IrBodyItem>,
    pub simple_join_start_index: Option<usize>,
@@ -221,8 +237,12 @@ const REL_DS_ATTR: &str = "ds";
 const RECOGNIIZED_REL_ATTRS: [&str; 1] = [REL_DS_ATTR];
 
 pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: bool) -> syn::Result<AscentIr> {
-   let ir_rules: Vec<(IrRule, Vec<IrRelation>)> =
-      prog.rules.iter().map(|r| compile_rule_to_ir_rule(r, prog)).try_collect()?;
+   let ir_rules: Vec<(IrRule, Vec<IrRelation>)> = prog
+      .rules
+      .iter()
+      .zip(&prog.rule_origins)
+      .map(|(r, &origin)| compile_rule_to_ir_rule(r, origin, prog))
+      .try_collect()?;
    let config = AscentConfig::new(prog.attributes.clone(), is_parallel)?;
    let num_relations = prog.relations.len();
    let mut relations_ir_relations: HashMap<RelationIdentity, HashSet<IrRelation>> =
@@ -318,7 +338,9 @@ fn get_ds_attr(attrs: &[Attribute]) -> syn::Result<Option<DsAttributeContents>> 
    }
 }
 
-fn compile_rule_to_ir_rule(rule: &RuleNode, prog: &AscentProgram) -> syn::Result<(IrRule, Vec<IrRelation>)> {
+fn compile_rule_to_ir_rule(
+   rule: &RuleNode, origin: usize, prog: &AscentProgram,
+) -> syn::Result<(IrRule, Vec<IrRelation>)> {
    let mut body_items = vec![];
    let mut grounded_vars = vec![];
    fn extend_grounded_vars(
@@ -481,7 +503,7 @@ fn compile_rule_to_ir_rule(rule: &RuleNode, prog: &AscentProgram) -> syn::Result
       }
    }
 
-   Ok((IrRule { simple_join_start_index, head_clauses, body_items }, vec![]))
+   Ok((IrRule { origin, simple_join_start_index, head_clauses, body_items }, vec![]))
 }
 
 pub fn ir_name_for_rel_indices(rel: &Ident, indices: &[usize]) -> Ident {

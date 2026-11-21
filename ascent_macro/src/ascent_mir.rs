@@ -9,8 +9,7 @@ use proc_macro2::{Ident, Span};
 use syn::{Expr, Type};
 
 use crate::ascent_hir::{
-   AscentConfig, AscentIr, IndexValType, IrAggClause, IrBodyClause, IrBodyItem, IrHeadClause, IrRelation, IrRule,
-   RelationMetadata,
+   AscentConfig, AscentIr, IndexValType, IrAggClause, IrBodyItem, IrHeadClause, IrRelation, IrRule, RelationMetadata,
 };
 use crate::ascent_mir::MirRelationVersion::*;
 use crate::ascent_syntax::{CondClause, GeneratorNode, RelationIdentity, Signatures};
@@ -28,6 +27,28 @@ pub(crate) struct AscentMir {
    pub signatures: Signatures,
    pub config: AscentConfig,
    pub is_parallel: bool,
+   pub provenance_relations: ProvenanceRelations,
+}
+
+/// The relations of a program, numbered by name for the provenance: the ids the generated code
+/// records derivations under. Built once per program, so that every use agrees on the numbering.
+pub(crate) struct ProvenanceRelations {
+   relations: Vec<RelationIdentity>,
+   ids: HashMap<RelationIdentity, usize>,
+}
+
+impl ProvenanceRelations {
+   pub fn new<'a>(relations: impl Iterator<Item = &'a RelationIdentity>) -> ProvenanceRelations {
+      let relations = relations.sorted_by_key(|rel| &rel.name).cloned().collect_vec();
+      let ids = relations.iter().enumerate().map(|(id, rel)| (rel.clone(), id)).collect();
+      ProvenanceRelations { relations, ids }
+   }
+
+   /// The relations in the order of their ids.
+   pub fn relations(&self) -> &[RelationIdentity] { &self.relations }
+
+   /// The id of `relation`.
+   pub fn id(&self, relation: &RelationIdentity) -> usize { self.ids[relation] }
 }
 
 pub(crate) struct MirScc {
@@ -53,6 +74,8 @@ pub(crate) fn mir_summary(mir: &AscentMir) -> String {
 
 #[derive(Clone)]
 pub(crate) struct MirRule {
+   /// The position of the rule in the program source this rule was compiled from
+   pub origin: usize,
    // TODO rename to head_clauses
    pub head_clause: Vec<IrHeadClause>,
    pub body_items: Vec<MirBodyItem>,
@@ -120,6 +143,8 @@ impl MirBodyItem {
 
 #[derive(Clone)]
 pub(crate) struct MirBodyClause {
+   /// The position of the clause in the body of the rule, before any reordering
+   pub body_ind: usize,
    pub rel: MirRelation,
    pub args: Vec<Expr>,
    pub rel_args_span: Span,
@@ -132,17 +157,6 @@ impl MirBodyClause {
    /// returns a vec of (var_ind, var) of all the variables in the clause
    pub fn vars(&self) -> Vec<(usize, Ident)> {
       self.args.iter().enumerate().filter_map(|(i, v)| expr_to_ident(v).map(|v| (i, v))).collect::<Vec<_>>()
-   }
-
-   #[allow(dead_code)]
-   pub fn from(ir_body_clause: IrBodyClause, rel: MirRelation) -> MirBodyClause {
-      MirBodyClause {
-         rel,
-         args: ir_body_clause.args,
-         rel_args_span: ir_body_clause.rel_args_span,
-         args_span: ir_body_clause.args_span,
-         cond_clauses: ir_body_clause.cond_clauses,
-      }
    }
 }
 
@@ -316,6 +330,7 @@ pub(crate) fn compile_hir_to_mir(hir: &AscentIr) -> syn::Result<AscentMir> {
       signatures: hir.signatures.clone(),
       config: hir.config.clone(),
       is_parallel: hir.is_parallel,
+      provenance_relations: ProvenanceRelations::new(hir.relations_ir_relations.keys()),
    })
 }
 
@@ -363,7 +378,9 @@ fn compile_hir_rule_to_mir_rules(rule: &IrRule, dynamic_relations: &HashSet<Rela
       res
    }
 
-   fn hir_body_item_to_mir_body_item(hir_bitem: &IrBodyItem, version: Option<MirRelationVersion>) -> MirBodyItem {
+   fn hir_body_item_to_mir_body_item(
+      hir_bitem: &IrBodyItem, body_ind: usize, version: Option<MirRelationVersion>,
+   ) -> MirBodyItem {
       match hir_bitem {
          IrBodyItem::Clause(_) => {},
          _ => assert!(version.is_none()),
@@ -373,6 +390,7 @@ fn compile_hir_rule_to_mir_rules(rule: &IrRule, dynamic_relations: &HashSet<Rela
             let ver = version.unwrap_or(MirRelationVersion::Total);
             let mir_relation = MirRelation::from(hir_bcl.rel.clone(), ver);
             let mir_bcl = MirBodyClause {
+               body_ind,
                rel: mir_relation,
                args: hir_bcl.args.clone(),
                rel_args_span: hir_bcl.rel_args_span,
@@ -408,8 +426,13 @@ fn compile_hir_rule_to_mir_rules(rule: &IrRule, dynamic_relations: &HashSet<Rela
             acc[*i] = Some(v);
             acc
          });
-      let mir_bodys =
-         rule.body_items.iter().zip(versions).map(|(bi, v)| hir_body_item_to_mir_body_item(bi, v)).collect_vec();
+      let mir_bodys = rule
+         .body_items
+         .iter()
+         .zip(versions)
+         .enumerate()
+         .map(|(i, (bi, v))| hir_body_item_to_mir_body_item(bi, i, v))
+         .collect_vec();
       mir_body_items.push(mir_bodys)
    }
 
@@ -423,6 +446,7 @@ fn compile_hir_rule_to_mir_rules(rule: &IrRule, dynamic_relations: &HashSet<Rela
             !intersects(pre_first_clause_vars, bcls[ind + 1].bound_vars())
          });
          MirRule {
+            origin: rule.origin,
             body_items: bcls,
             head_clause: rule.head_clauses.clone(),
             simple_join_start_index: rule.simple_join_start_index,
